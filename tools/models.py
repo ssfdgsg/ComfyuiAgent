@@ -368,46 +368,52 @@ def download_from_modelscope(
     file_pattern: str = "*.safetensors",
 ) -> dict:
     """
-    Download a model from ModelScope to the correct ComfyUI models directory.
+    Download a model from ModelScope using the `modelscope download` CLI.
 
-    Uses the modelscope SDK snapshot_download under the hood.
+    Public models need no token. Token (MODELSCOPE_TOKEN) is only used for
+    private/gated models and is passed via --token if set.
+
     model_id example: 'AI-ModelScope/stable-diffusion-xl-base-1.0'
     """
+    import subprocess
+
     if category not in MODEL_DIRS:
         return {"success": False, "error": f"Unknown category: {category}"}
 
     dest_dir = MODEL_DIRS[category]
     os.makedirs(dest_dir, exist_ok=True)
 
-    try:
-        from modelscope import snapshot_download
-        from modelscope.hub.api import HubApi
-    except ImportError:
-        return {"success": False, "error": "modelscope package not installed. Run: pip install modelscope"}
+    cmd = ["modelscope", "download", "--model", model_id, "--local_dir", dest_dir]
+
+    # Only append token when explicitly provided (private models)
+    if MODELSCOPE_TOKEN:
+        cmd += ["--token", MODELSCOPE_TOKEN]
 
     try:
-        if MODELSCOPE_TOKEN:
-            api = HubApi()
-            api.login(MODELSCOPE_TOKEN)
-
-        local_dir = snapshot_download(
-            model_id=model_id,
-            local_dir=dest_dir,
-            ignore_patterns=["*.bin", "*.ot", "*.msgpack", "flax_*", "tf_*"]
-            if file_pattern == "*.safetensors"
-            else [],
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-        # Compute total size
+        log = result.stdout.strip()
+        if result.returncode != 0:
+            return {"success": False, "path": "", "size_mb": 0, "error": log}
+
         total_mb = sum(
             os.path.getsize(os.path.join(r, f)) / 1024 / 1024
-            for r, _, files in os.walk(local_dir)
+            for r, _, files in os.walk(dest_dir)
             for f in files
+            if not f.startswith(".")
         )
         return {
             "success": True,
-            "path": local_dir,
+            "path": dest_dir,
             "size_mb": round(total_mb, 1),
+            "log": log,
             "error": "",
         }
+    except FileNotFoundError:
+        return {"success": False, "error": "modelscope CLI not found. Run: pip install modelscope"}
     except Exception as e:
         return {"success": False, "path": "", "size_mb": 0, "error": str(e)}
