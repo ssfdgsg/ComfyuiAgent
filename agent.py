@@ -668,15 +668,12 @@ class Agent:
             for tc in tool_calls_this_turn:
                 result = await asyncio.to_thread(self.core.dispatch_tool, tc.name, tc.input)
                 yield {"type": "tool_result", "name": tc.name, "result": result}
-                messages.append(
-                    self.core.dispatch_tool.__self__.__class__.dispatch_tool  # type: ignore
-                    if False else {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": tc.name,
-                        "content": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result,
-                    }
-                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result,
+                })
 
             # After any workflow mutation, emit current state
             if self.core.wf.node_count() > 0:
