@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import (
     MODEL_DIRS, MODELS_BASE,
-    HUGGINGFACE_TOKEN, CIVITAI_API_KEY,
+    HUGGINGFACE_TOKEN, CIVITAI_API_KEY, MODELSCOPE_TOKEN,
     COMFYUI_MODEL_LIST_URL,
     DOWNLOAD_CHUNK_SIZE, DOWNLOAD_TIMEOUT,
 )
@@ -324,3 +324,90 @@ def download_model_background(
     )
     t.start()
     return fname
+
+
+# ---------------------------------------------------------- ModelScope (魔搭)
+MODELSCOPE_API = "https://modelscope.cn/api/v1"
+
+
+def search_modelscope(query: str, limit: int = 10) -> list[dict]:
+    """
+    Search ModelScope (魔搭) for models.
+    Returns list of {model_id, name, downloads, url, task}.
+    """
+    headers = {}
+    if MODELSCOPE_TOKEN:
+        headers["Authorization"] = f"Token {MODELSCOPE_TOKEN}"
+    try:
+        r = requests.get(
+            f"{MODELSCOPE_API}/models",
+            params={"Name": query, "PageSize": limit, "SortBy": "Downloads"},
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return [{"error": str(e)}]
+
+    results = []
+    for m in data.get("Data", {}).get("Models", [])[:limit]:
+        results.append({
+            "model_id": m.get("Path", ""),
+            "name": m.get("Name", ""),
+            "downloads": m.get("Downloads", 0),
+            "url": f"https://modelscope.cn/models/{m.get('Path', '')}",
+            "task": m.get("Tasks", [{}])[0].get("Name", "") if m.get("Tasks") else "",
+        })
+    return results
+
+
+def download_from_modelscope(
+    model_id: str,
+    category: str,
+    file_pattern: str = "*.safetensors",
+) -> dict:
+    """
+    Download a model from ModelScope to the correct ComfyUI models directory.
+
+    Uses the modelscope SDK snapshot_download under the hood.
+    model_id example: 'AI-ModelScope/stable-diffusion-xl-base-1.0'
+    """
+    if category not in MODEL_DIRS:
+        return {"success": False, "error": f"Unknown category: {category}"}
+
+    dest_dir = MODEL_DIRS[category]
+    os.makedirs(dest_dir, exist_ok=True)
+
+    try:
+        from modelscope import snapshot_download
+        from modelscope.hub.api import HubApi
+    except ImportError:
+        return {"success": False, "error": "modelscope package not installed. Run: pip install modelscope"}
+
+    try:
+        if MODELSCOPE_TOKEN:
+            api = HubApi()
+            api.login(MODELSCOPE_TOKEN)
+
+        local_dir = snapshot_download(
+            model_id=model_id,
+            local_dir=dest_dir,
+            ignore_patterns=["*.bin", "*.ot", "*.msgpack", "flax_*", "tf_*"]
+            if file_pattern == "*.safetensors"
+            else [],
+        )
+        # Compute total size
+        total_mb = sum(
+            os.path.getsize(os.path.join(r, f)) / 1024 / 1024
+            for r, _, files in os.walk(local_dir)
+            for f in files
+        )
+        return {
+            "success": True,
+            "path": local_dir,
+            "size_mb": round(total_mb, 1),
+            "error": "",
+        }
+    except Exception as e:
+        return {"success": False, "path": "", "size_mb": 0, "error": str(e)}

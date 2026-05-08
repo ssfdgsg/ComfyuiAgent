@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ComfyUI Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- highlight.js for code blocks -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ HEADER ══════════════════════════════════ -->
+<header class="header">
+  <div class="header-left">
+    <span class="logo">⚡ ComfyUI Agent</span>
+    <span class="status-badge" id="ws-badge" data-state="connecting">● WS</span>
+    <span class="status-badge" id="comfy-badge" data-state="unknown">● ComfyUI</span>
+  </div>
+  <div class="header-right">
+    <span id="provider-label" class="provider-label">gemini</span>
+    <button class="btn-icon" id="settings-btn" title="设置">⚙</button>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════ SETTINGS DRAWER ═══════════════════════ -->
+<div id="settings-drawer" class="drawer hidden">
+  <div class="drawer-inner">
+    <h3>设置</h3>
+    <label>
+      LLM 提供商
+      <select id="s-provider">
+        <option value="gemini">Gemini</option>
+        <option value="openai">OpenAI 兼容</option>
+      </select>
+    </label>
+    <label>
+      API Key
+      <input type="password" id="s-api-key" placeholder="sk- 或 AI...">
+    </label>
+    <label>
+      模型名称
+      <input type="text" id="s-model" placeholder="gemini-2.0-flash-exp">
+    </label>
+    <label id="base-url-row">
+      API Base URL <small>(OpenAI 兼容)</small>
+      <input type="text" id="s-base-url" placeholder="https://api-inference.modelscope.cn/v1">
+    </label>
+    <div class="drawer-actions">
+      <button class="btn-primary" id="save-settings-btn">保存</button>
+      <button class="btn-ghost" id="close-settings-btn">取消</button>
+    </div>
+    <div id="settings-msg" class="settings-msg"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ MAIN LAYOUT ══════════════════════════════ -->
+<main class="layout">
+
+  <!-- LEFT: Workflow panel -->
+  <aside class="panel panel-left" id="workflow-panel">
+    <div class="panel-header">
+      <span>工作流</span>
+      <div class="panel-actions">
+        <button class="btn-sm btn-primary" id="exec-btn" title="执行工作流">▶ 执行</button>
+        <button class="btn-sm btn-ghost" id="save-wf-btn" title="保存">💾</button>
+      </div>
+    </div>
+    <div id="workflow-nodes" class="node-list">
+      <div class="empty-hint">暂无工作流<br>通过对话让 Agent 创建</div>
+    </div>
+  </aside>
+
+  <!-- CENTER: Chat -->
+  <div class="chat-area">
+    <div class="messages" id="messages"></div>
+
+    <!-- attachment preview -->
+    <div id="attach-preview" class="attach-preview hidden"></div>
+
+    <!-- input bar -->
+    <div class="input-bar">
+      <label class="attach-label" title="附加文件（图像/音频/视频）">
+        📎
+        <input type="file" id="file-input" multiple
+               accept="image/*,audio/*,video/*,.mp4,.webm,.mov,.avi">
+      </label>
+      <textarea id="msg-input" rows="1"
+                placeholder="描述你需要的工作流，或直接发指令…  (Shift+Enter 换行，Enter 发送)"></textarea>
+      <button class="send-btn" id="send-btn">▶</button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Resources panel -->
+  <aside class="panel panel-right" id="resources-panel">
+    <div class="panel-header">
+      <span>资源</span>
+      <button class="btn-sm btn-ghost" id="refresh-res-btn" title="刷新">↺</button>
+    </div>
+    <div id="resources-content" class="resources-content">
+      <div class="empty-hint">加载中…</div>
+    </div>
+  </aside>
+
+</main>
+
+<!-- ═══════════════════════════════ NODE EDIT MODAL ══════════════════════════ -->
+<div id="node-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span id="modal-title">编辑节点</span>
+      <button class="btn-icon" id="modal-close">✕</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+    <div class="modal-footer">
+      <button class="btn-primary" id="modal-save">保存</button>
+      <button class="btn-danger" id="modal-delete">删除节点</button>
+      <button class="btn-ghost" id="modal-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

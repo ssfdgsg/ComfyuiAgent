@@ -5,32 +5,36 @@ services:
     build: .
     image: comfyui-agent:latest
     container_name: comfyui-agent
-
-    # Expose ComfyUI web UI
     ports:
-      - "8188:8188"
+      - "8188:8188"   # ComfyUI Web UI
+      - "8080:8080"   # Agent Web UI
 
     environment:
-      # Required: your Anthropic API key
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      # Optional: improve model download quality
+      # ── LLM API Keys ──
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash-exp}
+      - DEFAULT_PROVIDER=${DEFAULT_PROVIDER:-gemini}
+
+      # ── Model hub tokens ──
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
       - CIVITAI_API_KEY=${CIVITAI_API_KEY:-}
-      # Run a one-shot task on container start (leave empty for no auto-task)
-      - AGENT_TASK=${AGENT_TASK:-}
-      # Set to "1" to start an interactive REPL on container start
-      - AGENT_REPL=${AGENT_REPL:-0}
-      # Agent model override
-      - AGENT_MODEL=${AGENT_MODEL:-claude-sonnet-4-6}
+      - MODELSCOPE_TOKEN=${MODELSCOPE_TOKEN:-}   # 魔搭 token
+
+      # ── ComfyUI ──
+      - COMFYUI_URL=http://localhost:8188
+      - COMFYUI_PATH=/root/ComfyUI
+
+      # ── Web server ──
+      - WEB_HOST=0.0.0.0
+      - WEB_PORT=8080
 
     volumes:
-      # Persist models between restarts
       - comfyui_models:/root/ComfyUI/models
-      # Persist custom nodes
       - comfyui_custom_nodes:/root/ComfyUI/custom_nodes
-      # Persist ComfyUI outputs
       - comfyui_output:/root/ComfyUI/output
-      # Persist agent state and saved workflows
       - ./state:/opt/comfyui-agent/state
       - ./workflows:/opt/comfyui-agent/workflows
 

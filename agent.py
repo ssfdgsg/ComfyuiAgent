@@ -1,35 +1,28 @@
 """
-ComfyUI Agent — main entry point.
+ComfyUI Agent — core logic and CLI entry point.
 
-Architecture
-============
-1. A single WorkflowManager holds the in-memory workflow.
-2. StateManager documents are refreshed after mutating operations.
-3. Claude (claude-sonnet-4-6) drives the agent loop via tool use.
-4. Tool descriptions keep the JSON payload small: summaries go to Claude,
-   full node details only on request.
-
-Usage
-=====
-  python agent.py "create a SDXL txt2img workflow with ControlNet"
-  python agent.py   # interactive REPL
+AgentCore  — holds in-memory workflow + all tool implementations (sync).
+Agent      — wraps AgentCore with an LLM provider loop.
+             .run_stream() → async generator of events (for web).
+             .run_sync()   → blocking string result (for CLI).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import textwrap
 import traceback
-from typing import Any
+from typing import Any, AsyncGenerator
 
-import anthropic
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-
+import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import ANTHROPIC_API_KEY, AGENT_MODEL, MAX_TOKENS, MAX_TOOL_ROUNDS, WORKFLOWS_DIR
+
+from config import (
+    MAX_TOOL_ROUNDS, WORKFLOWS_DIR,
+    GEMINI_API_KEY, OPENAI_API_KEY, DEFAULT_PROVIDER,
+)
 from tools.comfyui_api import get_client
 from tools.workflow import WorkflowManager, PRESET_BUILDERS
 from tools.models import (
@@ -37,41 +30,34 @@ from tools.models import (
     search_huggingface, search_civitai, get_hf_model_files,
     download_model, download_model_background, get_download_progress,
     get_comfyui_model_list,
+    search_modelscope, download_from_modelscope,
 )
 from tools.nodes import (
     list_installed_packages, get_installed_summary,
-    fetch_node_registry, search_nodes,
-    install_custom_node, install_node_by_title,
-    update_custom_node, uninstall_custom_node,
+    search_nodes, install_custom_node, install_node_by_title,
+    update_custom_node,
 )
 from tools.state import (
     refresh_resources_doc, read_resources_doc,
     update_workflow_state, read_workflow_state,
     log_operation, history_summary, get_agent_context,
 )
+from llm.base import MediaFile, TextChunk, ToolCallEvent, DoneEvent
 
-console = Console()
-
-# ============================================================== tool registry
+# ============================================================= tool definitions
 TOOLS: list[dict] = [
-    # -------------------------------------------------- workflow: inspection
+    # ─── workflow inspection ───
     {
         "name": "get_workflow_summary",
-        "description": (
-            "Return a compact text summary of the current in-memory workflow. "
-            "Always use this first to understand the workflow before making changes. "
-            "Returns node IDs, class types, connections, and key parameters."
-        ),
+        "description": "Return compact summary of the current workflow. Call this before any modification.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "get_node_detail",
-        "description": "Return the full JSON definition of a single node by ID.",
+        "description": "Return full JSON of a single node by ID.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "node_id": {"type": "string", "description": "The node ID string (e.g. '5')"}
-            },
+            "properties": {"node_id": {"type": "string"}},
             "required": ["node_id"],
         },
     },
@@ -80,29 +66,45 @@ TOOLS: list[dict] = [
         "description": "Return all nodes of a given class_type (e.g. 'KSampler').",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "class_type": {"type": "string"}
-            },
+            "properties": {"class_type": {"type": "string"}},
             "required": ["class_type"],
         },
     },
-    # -------------------------------------------------- workflow: mutation
+    # ─── workflow mutation ───
     {
-        "name": "add_node",
+        "name": "apply_workflow_patch",
         "description": (
-            "Add a single node to the workflow. "
-            "Input values can be scalars or link references [\"source_node_id\", output_slot_index]."
+            "Apply multiple workflow changes atomically. "
+            "Accepts 'add', 'remove', 'update', 'link', 'unlink' lists. "
+            "Prefer over individual calls for 3+ changes."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "class_type": {"type": "string", "description": "ComfyUI node class name"},
-                "inputs": {
+                "patch": {
                     "type": "object",
-                    "description": "Key-value inputs. Link format: [\"src_node_id\", slot_int]",
-                },
-                "title": {"type": "string", "description": "Display title (optional)"},
-                "node_id": {"type": "string", "description": "Force a specific ID (optional)"},
+                    "description": (
+                        '{"add":[{"class_type":"..","inputs":{},"title":"","node_id":""}],'
+                        '"remove":["id"],'
+                        '"update":[{"node_id":"..","inputs":{}}],'
+                        '"link":[{"from":"id","from_slot":0,"to":"id","to_input":"name"}],'
+                        '"unlink":[{"node_id":"id","input_name":"name"}]}'
+                    ),
+                }
+            },
+            "required": ["patch"],
+        },
+    },
+    {
+        "name": "add_node",
+        "description": "Add a single node. Input values can be scalars or [src_id, slot] links.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "class_type": {"type": "string"},
+                "inputs": {"type": "object"},
+                "title": {"type": "string"},
+                "node_id": {"type": "string"},
             },
             "required": ["class_type"],
         },
@@ -112,41 +114,39 @@ TOOLS: list[dict] = [
         "description": "Remove a node and all links pointing to it.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "node_id": {"type": "string"}
-            },
+            "properties": {"node_id": {"type": "string"}},
             "required": ["node_id"],
         },
     },
     {
         "name": "update_node",
-        "description": "Update (merge) the inputs/parameters of an existing node.",
+        "description": "Merge updates into a node's inputs.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string"},
-                "inputs": {"type": "object", "description": "Fields to update"},
+                "inputs": {"type": "object"},
             },
             "required": ["node_id", "inputs"],
         },
     },
     {
         "name": "create_link",
-        "description": "Connect an output slot of one node to an input of another.",
+        "description": "Connect output slot of one node to input of another.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "from_node_id": {"type": "string"},
-                "from_slot": {"type": "integer", "description": "Output slot index (0-based)"},
+                "from_slot": {"type": "integer"},
                 "to_node_id": {"type": "string"},
-                "to_input_name": {"type": "string", "description": "Target input field name"},
+                "to_input_name": {"type": "string"},
             },
             "required": ["from_node_id", "from_slot", "to_node_id", "to_input_name"],
         },
     },
     {
         "name": "remove_link",
-        "description": "Disconnect the link feeding a specific input of a node.",
+        "description": "Disconnect the link feeding a specific node input.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -156,107 +156,62 @@ TOOLS: list[dict] = [
             "required": ["node_id", "input_name"],
         },
     },
-    {
-        "name": "apply_workflow_patch",
-        "description": (
-            "Apply multiple workflow changes in one call (batch operation). "
-            "Accepts 'add', 'remove', 'update', 'link', 'unlink' lists. "
-            "Prefer this over individual calls when making 3+ changes at once."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "patch": {
-                    "type": "object",
-                    "description": textwrap.dedent("""
-                        {
-                          "add":    [{"class_type":"..","inputs":{},"title":"","node_id":""}],
-                          "remove": ["node_id"],
-                          "update": [{"node_id":"..","inputs":{}}],
-                          "link":   [{"from":"id","from_slot":0,"to":"id","to_input":"name"}],
-                          "unlink": [{"node_id":"id","input_name":"name"}]
-                        }
-                    """).strip(),
-                }
-            },
-            "required": ["patch"],
-        },
-    },
-    # -------------------------------------------------- workflow: lifecycle
-    {
-        "name": "load_workflow",
-        "description": "Load a workflow JSON file into memory (replaces current workflow).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Absolute or relative file path"},
-            },
-            "required": ["path"],
-        },
-    },
+    # ─── workflow lifecycle ───
     {
         "name": "load_workflow_preset",
-        "description": (
-            f"Load a built-in workflow preset. "
-            f"Available presets: {list(PRESET_BUILDERS.keys())}"
-        ),
+        "description": f"Load a built-in preset. Available: {list(PRESET_BUILDERS.keys())}",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "preset": {
-                    "type": "string",
-                    "enum": list(PRESET_BUILDERS.keys()),
-                }
-            },
+            "properties": {"preset": {"type": "string", "enum": list(PRESET_BUILDERS.keys())}},
             "required": ["preset"],
         },
     },
     {
+        "name": "load_workflow",
+        "description": "Load a workflow JSON file from the workflows/ directory or absolute path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
         "name": "save_workflow",
-        "description": "Save the current workflow to a JSON file.",
+        "description": "Save current workflow to a JSON file.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Filename prefix (no extension)"},
-                "path": {"type": "string", "description": "Full path override (optional)"},
+                "name": {"type": "string"},
+                "path": {"type": "string"},
             },
             "required": [],
         },
     },
     {
         "name": "queue_workflow",
-        "description": (
-            "Send the current workflow to ComfyUI for execution. "
-            "Returns the prompt_id for status tracking."
-        ),
+        "description": "Send the current workflow to ComfyUI for execution.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "get_execution_status",
-        "description": "Check the ComfyUI queue and recent history.",
+        "description": "Check ComfyUI queue and recent history.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
-    # ------------------------------------------ ComfyUI node type discovery
     {
         "name": "list_available_node_types",
-        "description": (
-            "Return all ComfyUI node class names registered in the running instance. "
-            "Use this to discover valid class_type values before adding nodes."
-        ),
+        "description": "Return all node class names registered in the running ComfyUI instance.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "get_node_type_info",
-        "description": "Get the input/output definition for a specific ComfyUI node class.",
+        "description": "Get input/output definition for a specific ComfyUI node class.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "class_type": {"type": "string"}
-            },
+            "properties": {"class_type": {"type": "string"}},
             "required": ["class_type"],
         },
     },
-    # --------------------------------------------------- model management
+    # ─── model management ───
     {
         "name": "list_local_models",
         "description": "List all model files installed in the ComfyUI models directory.",
@@ -269,27 +224,33 @@ TOOLS: list[dict] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "model_type": {
-                    "type": "string",
-                    "description": "HF pipeline_tag filter (e.g. 'text-to-image')",
-                },
-                "limit": {"type": "integer", "default": 8},
+                "model_type": {"type": "string"},
+                "limit": {"type": "integer"},
             },
             "required": ["query"],
         },
     },
     {
         "name": "search_models_civitai",
-        "description": "Search CivitAI for models (checkpoints, LoRAs, ControlNets, etc.).",
+        "description": "Search CivitAI for checkpoints, LoRAs, ControlNets, etc.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "model_type": {
-                    "type": "string",
-                    "description": "One of: checkpoint, lora, lycoris, textual_inversion, hypernetwork, controlnet, vae, upscaler",
-                },
-                "limit": {"type": "integer", "default": 8},
+                "model_type": {"type": "string", "description": "checkpoint|lora|controlnet|vae|upscaler"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_models_modelscope",
+        "description": "Search ModelScope (魔搭) for models.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
             },
             "required": ["query"],
         },
@@ -299,48 +260,39 @@ TOOLS: list[dict] = [
         "description": "List downloadable files for a HuggingFace repo.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "repo_id": {"type": "string", "description": "e.g. 'stabilityai/stable-diffusion-xl-base-1.0'"}
-            },
+            "properties": {"repo_id": {"type": "string"}},
             "required": ["repo_id"],
         },
     },
     {
-        "name": "search_comfyui_model_list",
-        "description": "Search the official ComfyUI Manager model registry.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"}
-            },
-            "required": ["query"],
-        },
-    },
-    {
         "name": "download_model",
-        "description": (
-            "Download a model file to the correct ComfyUI models sub-directory. "
-            "The download runs synchronously and shows progress."
-        ),
+        "description": "Download a model from a direct URL to the correct ComfyUI directory (streaming).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Direct download URL"},
-                "category": {
-                    "type": "string",
-                    "description": "Model category: checkpoints, vae, loras, controlnet, embeddings, upscale_models, clip, unet, clip_vision, ipadapter, ...",
-                },
-                "filename": {"type": "string", "description": "Override filename (optional)"},
+                "url": {"type": "string"},
+                "category": {"type": "string", "description": "checkpoints|vae|loras|controlnet|embeddings|..."},
+                "filename": {"type": "string"},
             },
             "required": ["url", "category"],
         },
     },
     {
+        "name": "download_from_modelscope",
+        "description": "Download a model from ModelScope (魔搭) using the modelscope SDK.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "model_id": {"type": "string", "description": "e.g. 'AI-ModelScope/stable-diffusion-xl-base-1.0'"},
+                "category": {"type": "string"},
+                "file_pattern": {"type": "string", "description": "e.g. '*.safetensors'"},
+            },
+            "required": ["model_id", "category"],
+        },
+    },
+    {
         "name": "download_model_background",
-        "description": (
-            "Start a model download in the background (non-blocking). "
-            "Returns immediately. Use get_download_status to track progress."
-        ),
+        "description": "Start a URL model download in the background. Use get_download_status to track.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -353,10 +305,10 @@ TOOLS: list[dict] = [
     },
     {
         "name": "get_download_status",
-        "description": "Check the progress of background model downloads.",
+        "description": "Check progress of background model downloads.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
-    # ------------------------------------------------ custom node management
+    # ─── custom nodes ───
     {
         "name": "list_installed_nodes",
         "description": "List all installed custom node packages.",
@@ -367,10 +319,7 @@ TOOLS: list[dict] = [
         "description": "Search the ComfyUI Manager custom node registry.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 10},
-            },
+            "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
             "required": ["query"],
         },
     },
@@ -380,12 +329,8 @@ TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "git_url": {"type": "string", "description": "GitHub/GitLab URL of the custom node repo"},
-                "pip_packages": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Additional pip packages to install",
-                },
+                "git_url": {"type": "string"},
+                "pip_packages": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["git_url"],
         },
@@ -395,88 +340,85 @@ TOOLS: list[dict] = [
         "description": "Install a custom node by its title from the ComfyUI Manager registry.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Exact node title from registry"}
-            },
+            "properties": {"title": {"type": "string"}},
             "required": ["title"],
         },
     },
     {
         "name": "update_custom_node",
-        "description": "Pull latest updates for an installed custom node.",
+        "description": "Pull latest updates for an installed custom node package.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Package directory name"}
-            },
+            "properties": {"name": {"type": "string"}},
             "required": ["name"],
         },
     },
-    # ---------------------------------------------------- state / docs
+    # ─── state / docs ───
     {
         "name": "refresh_resources",
-        "description": "Re-scan models and custom nodes; rewrite resources.md. Call this after installing anything.",
+        "description": "Re-scan models and custom nodes; rewrite resources.md. Call after installing anything.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "read_resources",
-        "description": "Read the current resources.md document (models + custom nodes).",
+        "description": "Read the current resources.md (models + custom nodes).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "read_workflow_state",
-        "description": "Read the persisted workflow state document.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "read_operation_history",
-        "description": "Read recent operation history.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "n": {"type": "integer", "default": 20}
-            },
-            "required": [],
-        },
     },
     {
         "name": "list_saved_workflows",
-        "description": "List workflow JSON files saved in the workflows/ directory.",
+        "description": "List saved workflow JSON files.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
+SYSTEM_PROMPT = textwrap.dedent("""
+    You are a ComfyUI automation agent running inside a yanwk/comfyui-boot container.
 
-# ================================================================ tool router
-class Agent:
+    Capabilities:
+    - Build and modify ComfyUI workflows (add/remove nodes, links, parameters)
+    - Search and download models from HuggingFace, CivitAI, or ModelScope (魔搭)
+    - Search and install custom node packages from the ComfyUI Manager registry
+    - Execute workflows and monitor results
+
+    Rules:
+    1. Always call get_workflow_summary before modifying the workflow.
+    2. Use apply_workflow_patch for 3+ changes in a single call.
+    3. After installing models or nodes, call refresh_resources.
+    4. Always call save_workflow when the workflow is complete.
+    5. Verify node class_type with list_available_node_types when ComfyUI is reachable.
+""").strip()
+
+
+# ============================================================= AgentCore
+class AgentCore:
+    """Holds workflow state and implements all tool dispatch (synchronous)."""
+
     def __init__(self):
-        if not ANTHROPIC_API_KEY:
-            raise RuntimeError("ANTHROPIC_API_KEY environment variable not set.")
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.wf = WorkflowManager()
         self._current_wf_file: str = ""
 
-    # ----------------------------------------------------- tool dispatch
-    def _dispatch(self, name: str, inp: dict) -> Any:
+    # ---------------------------------------------------------------- dispatch
+    def dispatch_tool(self, name: str, inp: dict) -> Any:
         try:
             return self._run_tool(name, inp)
         except Exception as e:
-            tb = traceback.format_exc()
-            return {"error": str(e), "traceback": tb}
+            return {"error": str(e), "traceback": traceback.format_exc()}
 
     def _run_tool(self, name: str, inp: dict) -> Any:
-        # ---- workflow inspection ----
+        # ── workflow inspection ──
         if name == "get_workflow_summary":
             return self.wf.get_summary()
-
         if name == "get_node_detail":
             node = self.wf.get_node(inp["node_id"])
-            return node if node else {"error": f"Node {inp['node_id']} not found"}
-
+            return node or {"error": f"Node {inp['node_id']} not found"}
         if name == "get_nodes_by_type":
             return self.wf.get_nodes_by_type(inp["class_type"])
 
-        # ---- workflow mutation ----
+        # ── workflow mutation ──
+        if name == "apply_workflow_patch":
+            log = self.wf.apply_patch(inp["patch"])
+            self._save_state("apply_patch", {"changes": len(log)})
+            return {"log": log}
         if name == "add_node":
             nid = self.wf.add_node(
                 class_type=inp["class_type"],
@@ -485,197 +427,133 @@ class Agent:
                 node_id=inp.get("node_id"),
             )
             self._save_state("add_node", {"class_type": inp["class_type"], "node_id": nid})
-            return {"node_id": nid, "class_type": inp["class_type"]}
-
+            return {"node_id": nid}
         if name == "remove_node":
             ok = self.wf.remove_node(inp["node_id"])
-            self._save_state("remove_node", {"node_id": inp["node_id"], "success": ok})
+            self._save_state("remove_node", {"node_id": inp["node_id"]})
             return {"success": ok}
-
         if name == "update_node":
             ok = self.wf.update_node_inputs(inp["node_id"], inp["inputs"])
             self._save_state("update_node", {"node_id": inp["node_id"]})
             return {"success": ok}
-
         if name == "create_link":
-            ok = self.wf.create_link(
-                inp["from_node_id"], inp["from_slot"],
-                inp["to_node_id"], inp["to_input_name"]
-            )
+            ok = self.wf.create_link(inp["from_node_id"], inp["from_slot"], inp["to_node_id"], inp["to_input_name"])
             self._save_state("create_link", inp)
             return {"success": ok}
-
         if name == "remove_link":
             ok = self.wf.remove_link(inp["node_id"], inp["input_name"])
-            self._save_state("remove_link", inp)
             return {"success": ok}
 
-        if name == "apply_workflow_patch":
-            log = self.wf.apply_patch(inp["patch"])
-            self._save_state("apply_patch", {"changes": len(log)})
-            return {"log": log}
-
-        # ---- workflow lifecycle ----
+        # ── workflow lifecycle ──
+        if name == "load_workflow_preset":
+            builder = PRESET_BUILDERS[inp["preset"]]
+            self.wf = builder()
+            self._current_wf_file = ""
+            self._save_state("load_preset", {"preset": inp["preset"]})
+            return {"node_count": self.wf.node_count(), "summary": self.wf.get_summary()}
         if name == "load_workflow":
             path = inp["path"]
             if not os.path.isabs(path):
                 path = os.path.join(WORKFLOWS_DIR, path)
             self.wf = WorkflowManager.from_file(path)
             self._current_wf_file = path
-            self._save_state("load_workflow", {"path": path, "nodes": self.wf.node_count()})
+            self._save_state("load_workflow", {"path": path})
             return {"loaded": path, "node_count": self.wf.node_count()}
-
-        if name == "load_workflow_preset":
-            builder = PRESET_BUILDERS[inp["preset"]]
-            self.wf = builder()
-            self._current_wf_file = ""
-            self._save_state("load_preset", {"preset": inp["preset"]})
-            return {"preset": inp["preset"], "node_count": self.wf.node_count(),
-                    "summary": self.wf.get_summary()}
-
         if name == "save_workflow":
             path = inp.get("path")
             saved = self.wf.save(path=path, name=inp.get("name"))
             self._current_wf_file = saved
             self._save_state("save_workflow", {"path": saved})
             return {"saved": saved}
-
         if name == "queue_workflow":
             c = get_client()
             if not c.is_alive():
-                return {"error": "ComfyUI is not reachable at " + c.base}
+                return {"error": "ComfyUI not reachable at " + c.base}
             result = c.queue_prompt(self.wf.to_api_format())
             self._save_state("queue_workflow", result)
             return result
-
         if name == "get_execution_status":
             c = get_client()
             if not c.is_alive():
                 return {"comfyui": "offline"}
-            queue = c.get_queue()
-            history = c.get_history(max_items=5)
-            return {"queue": queue, "recent_history_ids": list(history.keys())}
-
-        # ---- ComfyUI node type discovery ----
+            return {"queue": c.get_queue(), "recent_ids": list(c.get_history(5).keys())}
         if name == "list_available_node_types":
             c = get_client()
             if not c.is_alive():
-                return {"error": "ComfyUI offline — cannot query node types"}
+                return {"error": "ComfyUI offline"}
             types = c.list_available_node_types()
             return {"count": len(types), "types": types}
-
         if name == "get_node_type_info":
             c = get_client()
             if not c.is_alive():
                 return {"error": "ComfyUI offline"}
             return c.get_object_info_node(inp["class_type"])
 
-        # ---- model management ----
+        # ── models ──
         if name == "list_local_models":
             return scan_local_models()
-
         if name == "search_models_huggingface":
-            return search_huggingface(
-                inp["query"],
-                model_type=inp.get("model_type", ""),
-                limit=inp.get("limit", 8),
-            )
-
+            return search_huggingface(inp["query"], model_type=inp.get("model_type", ""), limit=inp.get("limit", 8))
         if name == "search_models_civitai":
-            return search_civitai(
-                inp["query"],
-                model_type=inp.get("model_type", ""),
-                limit=inp.get("limit", 8),
-            )
-
+            return search_civitai(inp["query"], model_type=inp.get("model_type", ""), limit=inp.get("limit", 8))
+        if name == "search_models_modelscope":
+            return search_modelscope(inp["query"], limit=inp.get("limit", 10))
         if name == "get_huggingface_model_files":
             return get_hf_model_files(inp["repo_id"])
-
-        if name == "search_comfyui_model_list":
-            q = inp["query"].lower()
-            models = get_comfyui_model_list()
-            results = [
-                m for m in models
-                if q in str(m.get("name", "")).lower()
-                or q in str(m.get("description", "")).lower()
-            ]
-            return results[:15]
-
         if name == "download_model":
-            result = download_model(
-                url=inp["url"],
-                category=inp["category"],
-                filename=inp.get("filename"),
+            result = download_model(url=inp["url"], category=inp["category"], filename=inp.get("filename"))
+            if result["success"]:
+                refresh_resources_doc()
+                self._save_state("download_model", {"category": inp["category"], "size_mb": result["size_mb"]})
+            return result
+        if name == "download_from_modelscope":
+            result = download_from_modelscope(
+                model_id=inp["model_id"], category=inp["category"],
+                file_pattern=inp.get("file_pattern", "*.safetensors"),
             )
             if result["success"]:
                 refresh_resources_doc()
-                self._save_state("download_model", {
-                    "category": inp["category"],
-                    "filename": inp.get("filename", ""),
-                    "size_mb": result["size_mb"],
-                })
+                self._save_state("download_modelscope", {"model_id": inp["model_id"]})
             return result
-
         if name == "download_model_background":
-            key = download_model_background(
-                url=inp["url"],
-                category=inp["category"],
-                filename=inp.get("filename"),
-            )
+            key = download_model_background(url=inp["url"], category=inp["category"], filename=inp.get("filename"))
             return {"tracking_key": key, "status": "started"}
-
         if name == "get_download_status":
             return get_download_progress()
 
-        # ---- custom nodes ----
+        # ── custom nodes ──
         if name == "list_installed_nodes":
             return list_installed_packages()
-
         if name == "search_custom_nodes":
             return search_nodes(inp["query"], limit=inp.get("limit", 10))
-
         if name == "install_custom_node":
             result = install_custom_node(inp["git_url"], inp.get("pip_packages"))
             if result["success"]:
                 refresh_resources_doc()
-                self._save_state("install_node", {"git_url": inp["git_url"], "name": result["name"]})
+                self._save_state("install_node", {"git_url": inp["git_url"]})
             return result
-
         if name == "install_node_by_title":
             result = install_node_by_title(inp["title"])
             if result.get("success"):
                 refresh_resources_doc()
                 self._save_state("install_node", {"title": inp["title"]})
             return result
-
         if name == "update_custom_node":
             return update_custom_node(inp["name"])
 
-        # ---- state / docs ----
+        # ── state ──
         if name == "refresh_resources":
             content = refresh_resources_doc()
-            return {"refreshed": True, "preview": content[:500]}
-
+            return {"refreshed": True, "preview": content[:400]}
         if name == "read_resources":
             return read_resources_doc()
-
-        if name == "read_workflow_state":
-            return read_workflow_state()
-
-        if name == "read_operation_history":
-            return history_summary(n=inp.get("n", 20))
-
         if name == "list_saved_workflows":
             os.makedirs(WORKFLOWS_DIR, exist_ok=True)
-            files = [
-                f for f in os.listdir(WORKFLOWS_DIR) if f.endswith(".json")
-            ]
-            return {"files": sorted(files)}
+            return {"files": sorted(f for f in os.listdir(WORKFLOWS_DIR) if f.endswith(".json"))}
 
         return {"error": f"Unknown tool: {name}"}
 
     def _save_state(self, op: str, details: dict):
-        """Persist state doc + log after a mutating operation."""
         log_operation(op, details)
         if self.wf.node_count() > 0:
             update_workflow_state(
@@ -683,116 +561,172 @@ class Agent:
                 workflow_file=self._current_wf_file,
             )
 
-    # --------------------------------------------------------- agent loop
-    def run(self, user_message: str) -> str:
-        """Run one user turn through the full tool-use loop."""
-        # Build system prompt with current state context
+    def workflow_nodes_json(self) -> list[dict]:
+        """Return nodes as a list suitable for the web UI."""
+        nodes = []
+        for nid, node in self.wf._nodes.items():
+            nodes.append({
+                "id": nid,
+                "class_type": node.get("class_type", ""),
+                "title": node.get("_meta", {}).get("title", ""),
+                "inputs": node.get("inputs", {}),
+            })
+        return sorted(nodes, key=lambda x: int(x["id"]) if x["id"].isdigit() else 0)
+
+
+# ============================================================= Agent (LLM loop)
+class Agent:
+    def __init__(
+        self,
+        provider: str = "",
+        api_key: str = "",
+        model: str = "",
+        base_url: str = "",
+    ):
+        from llm.provider import create_provider
+        self.core = AgentCore()
+        self._provider_name = provider or DEFAULT_PROVIDER
+        self._api_key = api_key
+        self._model = model
+        self._base_url = base_url
+        self._llm = self._make_provider()
+
+    def _make_provider(self):
+        from llm.provider import create_provider
+        return create_provider(
+            provider=self._provider_name,
+            api_key=self._api_key,
+            model=self._model,
+            base_url=self._base_url,
+        )
+
+    def update_settings(self, provider: str = "", api_key: str = "", model: str = "", base_url: str = ""):
+        """Hot-reload provider settings (called from web /api/settings)."""
+        if provider:
+            self._provider_name = provider
+        if api_key:
+            self._api_key = api_key
+        if model:
+            self._model = model
+        if base_url:
+            self._base_url = base_url
+        self._llm = self._make_provider()
+
+    def _build_system(self) -> str:
         context = get_agent_context()
-        system = textwrap.dedent(f"""
-            You are a ComfyUI automation agent running inside a yanwk/comfyui-boot container.
+        return SYSTEM_PROMPT + "\n\n" + context
 
-            Your capabilities:
-            - Build and modify ComfyUI workflows (add/remove nodes, create links)
-            - Search and install models from HuggingFace and CivitAI
-            - Search and install custom node packages from the ComfyUI Manager registry
-            - Execute workflows and monitor results
-
-            Guidelines:
-            1. Always call get_workflow_summary before modifying the workflow.
-            2. When creating a workflow from scratch, prefer apply_workflow_patch to build
-               multiple nodes at once rather than repeated add_node calls.
-            3. Before adding a node, verify its class_type exists via list_available_node_types
-               if ComfyUI is running; otherwise rely on built-in knowledge.
-            4. For long workflows, use get_nodes_by_type or get_node_detail to fetch only
-               the parts you need — never dump the full JSON unless explicitly asked.
-            5. After installing models or nodes, call refresh_resources so the state doc
-               reflects the change.
-            6. When a workflow is complete, always call save_workflow.
-
-            {context}
-        """).strip()
-
+    async def run_stream(
+        self,
+        user_message: str,
+        media_files: list[MediaFile] | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Async generator that yields dicts for the WebSocket:
+          {"type": "token",          "content": "..."}
+          {"type": "tool_call",      "name": "...", "input": {...}}
+          {"type": "tool_result",    "name": "...", "result": {...}}
+          {"type": "workflow_update","nodes": [...], "summary": "..."}
+          {"type": "done",           "content": "..."}
+        """
         messages: list[dict] = [{"role": "user", "content": user_message}]
-        console.print(Panel(f"[bold cyan]User:[/] {user_message}", expand=False))
+        system = self._build_system()
 
         for _round in range(MAX_TOOL_ROUNDS):
-            response = self.client.messages.create(
-                model=AGENT_MODEL,
-                max_tokens=MAX_TOKENS,
-                system=system,
-                tools=TOOLS,
+            tool_calls_this_turn: list[ToolCallEvent] = []
+            full_text = ""
+
+            async for event in self._llm.generate_stream(
                 messages=messages,
-            )
+                tools=TOOLS,
+                system=system,
+                media_files=media_files if _round == 0 else None,
+            ):
+                if isinstance(event, TextChunk):
+                    full_text += event.content
+                    yield {"type": "token", "content": event.content}
+                elif isinstance(event, ToolCallEvent):
+                    tool_calls_this_turn.append(event)
+                    yield {"type": "tool_call", "id": event.id, "name": event.name, "input": event.input}
+                elif isinstance(event, DoneEvent):
+                    full_text = event.content
 
-            # Collect all text + tool use blocks
-            tool_uses = []
-            text_parts = []
-            for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                elif block.type == "tool_use":
-                    tool_uses.append(block)
+            if not tool_calls_this_turn:
+                # Pure text response — we're done
+                yield {"type": "done", "content": full_text}
+                return
 
-            if text_parts:
-                combined_text = "\n".join(text_parts)
-                console.print(Markdown(combined_text))
+            # Append assistant turn (text + tool calls)
+            assistant_content: list[dict] = []
+            if full_text:
+                assistant_content.append({"type": "text", "text": full_text})
+            for tc in tool_calls_this_turn:
+                assistant_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input})
+            messages.append({"role": "assistant", "content": assistant_content})
 
-            if response.stop_reason == "end_turn" or not tool_uses:
-                return "\n".join(text_parts)
+            # Execute tools and append results
+            for tc in tool_calls_this_turn:
+                result = await asyncio.to_thread(self.core.dispatch_tool, tc.name, tc.input)
+                yield {"type": "tool_result", "name": tc.name, "result": result}
+                messages.append(
+                    self.core.dispatch_tool.__self__.__class__.dispatch_tool  # type: ignore
+                    if False else {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "content": json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result,
+                    }
+                )
 
-            # Append assistant turn
-            messages.append({"role": "assistant", "content": response.content})
+            # After any workflow mutation, emit current state
+            if self.core.wf.node_count() > 0:
+                yield {
+                    "type": "workflow_update",
+                    "nodes": self.core.workflow_nodes_json(),
+                    "summary": self.core.wf.get_summary(),
+                }
 
-            # Execute all tools in this turn (possibly multiple)
-            tool_results = []
-            for tu in tool_uses:
-                console.print(f"  [dim]→ tool: [yellow]{tu.name}[/] {json.dumps(tu.input)[:120]}[/]")
-                result = self._dispatch(tu.name, tu.input)
-                result_str = json.dumps(result, ensure_ascii=False, indent=2)
-                if len(result_str) > 6000:
-                    result_str = result_str[:5900] + "\n... (truncated)"
-                console.print(f"  [dim]← {result_str[:200]}[/]")
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tu.id,
-                    "content": result_str,
-                })
+        yield {"type": "done", "content": "Max iterations reached."}
 
-            messages.append({"role": "user", "content": tool_results})
+    def run_sync(self, user_message: str) -> str:
+        """Blocking CLI version."""
+        return asyncio.run(self._collect(user_message))
 
-        return "Max tool rounds reached."
+    async def _collect(self, user_message: str) -> str:
+        parts = []
+        async for event in self.run_stream(user_message):
+            if event["type"] == "token":
+                print(event["content"], end="", flush=True)
+                parts.append(event["content"])
+            elif event["type"] == "tool_call":
+                print(f"\n[tool] {event['name']} {json.dumps(event['input'])[:80]}", flush=True)
+            elif event["type"] == "tool_result":
+                r = json.dumps(event["result"])[:120]
+                print(f"[result] {r}", flush=True)
+            elif event["type"] == "done":
+                print()
+                return event["content"]
+        return "".join(parts)
 
-    def repl(self):
-        """Interactive REPL mode."""
-        console.print(Panel(
-            "[bold green]ComfyUI Agent[/]\n"
-            "Type your instruction, or 'exit' to quit.\n"
-            f"Model: {AGENT_MODEL}  |  ComfyUI: {get_client().base}",
-            title="Agent Ready"
-        ))
+
+# ============================================================= CLI
+def main():
+    import sys as _sys
+    if len(_sys.argv) > 1:
+        task = " ".join(_sys.argv[1:])
+        agent = Agent()
+        agent.run_sync(task)
+    else:
+        agent = Agent()
+        print(f"ComfyUI Agent REPL (provider: {agent._provider_name}) — type 'exit' to quit")
         while True:
             try:
-                user_input = input("\n[You] ").strip()
+                msg = input("\n> ").strip()
             except (EOFError, KeyboardInterrupt):
-                console.print("\n[yellow]Goodbye.[/]")
                 break
-            if not user_input:
-                continue
-            if user_input.lower() in {"exit", "quit", "q"}:
-                console.print("[yellow]Goodbye.[/]")
+            if not msg or msg.lower() in ("exit", "quit"):
                 break
-            self.run(user_input)
-
-
-# ================================================================ entrypoint
-def main():
-    agent = Agent()
-
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        agent.run(task)
-    else:
-        agent.repl()
+            agent.run_sync(msg)
 
 
 if __name__ == "__main__":
