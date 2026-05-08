@@ -369,17 +369,10 @@ $('settings-btn').onclick = async () => {
     $('s-provider').value = s.provider || 'gemini';
     $('s-model').value    = s.model || '';
     $('s-base-url').value = s.base_url || '';
-    toggleBaseUrl(s.provider);
   }
 };
 
 $('close-settings-btn').onclick = () => drawer.classList.add('hidden');
-
-$('s-provider').onchange = () => toggleBaseUrl($('s-provider').value);
-
-function toggleBaseUrl(provider) {
-  $('base-url-row').style.display = provider === 'openai' ? 'flex' : 'none';
-}
 
 $('save-settings-btn').onclick = async () => {
   const payload = {

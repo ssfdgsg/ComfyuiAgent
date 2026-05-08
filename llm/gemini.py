@@ -128,13 +128,21 @@ class GeminiProvider(LLMProvider):
         self,
         api_key: str = "",
         model: str = "",
+        base_url: str = "",
     ):
         from google import genai
+        from google.genai import types as _types
 
         key = api_key or GEMINI_API_KEY
         if not key:
             raise RuntimeError("GEMINI_API_KEY not set")
-        self._client = genai.Client(api_key=key)
+
+        client_kwargs: dict = {"api_key": key}
+        if base_url:
+            # Support proxy / custom Gemini-compatible endpoints
+            client_kwargs["http_options"] = _types.HttpOptions(base_url=base_url)
+
+        self._client = genai.Client(**client_kwargs)
         self._model = model or GEMINI_MODEL
 
     async def generate_stream(
